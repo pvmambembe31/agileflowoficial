@@ -1,0 +1,7 @@
+{
+  "name": "agileflow-stable",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AgileFlow 1.0 Stable — personal project management and professional portfolio workspace",
+  "scripts": {"serve": "python -m http.server 8080"}
+}

@@ -1,0 +1,9 @@
+{
+  "app": "AgileFlow",
+  "appVersion": "1.0.0",
+  "releaseChannel": "stable",
+  "bridgeProtocol": 1,
+  "dataSchema": 17,
+  "storageKey": "agileflow.v01",
+  "build": "stable-1"
+}

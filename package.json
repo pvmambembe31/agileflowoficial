@@ -1,7 +1,7 @@
 {
   "name": "agileflow-stable",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "AgileFlow 1.0 Stable — personal project management and professional portfolio workspace",
+  "description": "AgileFlow 1.1 — personal workspace hosted on Debian",
   "scripts": {"serve": "python -m http.server 8080"}
 }

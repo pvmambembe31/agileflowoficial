@@ -1,56 +1,42 @@
-const STORAGE_KEY = 'agileflow.v01'; // Mantido de propósito para preservar os dados da v0.1.
 const SCHEMA_VERSION = 17;
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const RELEASE_CHANNEL = 'stable';
-const BRIDGE_PROTOCOL_VERSION = 1;
-const BRIDGE_BASE_URL = 'http://127.0.0.1:43127/api/v1';
-const BRIDGE_TOKEN_KEY = 'agileflow.bridge.token';
+const API_BASE_URL = `${location.origin}/api/v1`;
 
 function hostingProvider() {
   const host = String(location.hostname || '').toLowerCase();
-  if (host.endsWith('.netlify.app')) return 'Netlify';
-  if (host.endsWith('.github.io')) return 'GitHub Pages';
-  if (host === 'localhost' || host === '127.0.0.1') return 'Local preview';
-  return 'Web host';
+  if (host === 'localhost' || host === '127.0.0.1') return 'Servidor local';
+  return 'Servidor AgileFlow';
 }
 
 function hostingOrigin() {
   try { return location.origin; } catch { return ''; }
 }
 
-let bridgeStatus = { state: 'checking', connected: false, paired: false, platform: null, root: null, workspaceExists: false, workspaceModified: null, version: null, error: null };
-let bridgeSyncTimer = null;
-let bridgeStartupResolved = false;
-let bridgeHeartbeatTimer = null;
-let syncState = { code: 'checking', pending: false, detail: 'Verificando armazenamento local', at: null };
-let startupConflict = null;
-let syncConflictActive = false;
-
-// A persistência precisa existir ANTES da normalização inicial, porque normalizeState()
-// salva migrações imediatamente ao carregar versões anteriores do workspace.
-const persistenceAdapter = {
-  kind: 'localStorage',
-  async read() { return localStorage.getItem(STORAGE_KEY); },
-  writeSync(value) { localStorage.setItem(STORAGE_KEY, value); },
-  async write(value) { localStorage.setItem(STORAGE_KEY, value); },
-  async health() { return { connected: true, kind: 'localStorage' }; }
-};
-
+let serverStatus = { connected: false, root: '/srv/agileflow', version: null, workspaceModified: null, error: null };
+let serverToken = null;
+let serverRevision = null;
+let pendingSnapshot = null;
+let saveTimer = null;
+let saveInFlight = false;
+let heartbeatTimer = null;
+let startupReady = false;
+let serverConflictActive = false;
+let syncState = { code: 'checking', pending: false, detail: 'Carregando dados do servidor', at: null };
 
 function syncPresentation() {
   const map = {
-    checking: { label: 'Checking…', cls: 'checking', icon: '◌' },
-    syncing: { label: 'Syncing', cls: 'syncing', icon: '↻' },
-    saved: { label: 'Saved locally', cls: 'saved', icon: '✓' },
-    offline: { label: 'Offline changes', cls: 'offline', icon: '!' },
-    browser: { label: 'Saved in browser', cls: 'browser', icon: '✓' },
-    error: { label: 'Sync error', cls: 'error', icon: '!' }
+    checking: { label: 'Conectando', cls: 'checking', icon: '◌' },
+    syncing: { label: 'Salvando', cls: 'syncing', icon: '↻' },
+    saved: { label: 'Salvo no servidor', cls: 'saved', icon: '✓' },
+    offline: { label: 'Sem conexão', cls: 'offline', icon: '!' },
+    error: { label: 'Ação necessária', cls: 'error', icon: '!' }
   };
   return map[syncState.code] || map.checking;
 }
 
 function setSyncState(code, detail = '', { pending = syncState.pending, at = null } = {}) {
-  syncState = { code, detail, pending, at: at || (['saved','browser'].includes(code) ? new Date().toISOString() : syncState.at) };
+  syncState = { code, detail, pending, at: at || (code === 'saved' ? new Date().toISOString() : syncState.at) };
   updateSyncIndicator();
 }
 
@@ -66,109 +52,127 @@ function updateSyncIndicator() {
   el.setAttribute('aria-label', titleParts.filter(Boolean).join('. ') || view.label);
 }
 
-async function bridgeHeartbeat() {
-  if (syncConflictActive) return;
-  if (!state?.preferences?.bridgePrimaryEnabled) return;
+async function serverFetch(path, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (serverToken) headers.set('X-AgileFlow-Token', serverToken);
+  return fetch(`${API_BASE_URL}${path}`, { cache: 'no-store', credentials: 'same-origin', ...init, headers });
+}
+
+async function connectServer() {
+  const healthRes = await serverFetch('/health');
+  if (!healthRes.ok) throw new Error(`Servidor indisponível (${healthRes.status})`);
+  const health = await healthRes.json();
+  const pairRes = await serverFetch('/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (!pairRes.ok) throw new Error(`Autenticação do servidor falhou (${pairRes.status})`);
+  const pair = await pairRes.json();
+  if (!pair.token) throw new Error('Servidor não forneceu token de acesso');
+  serverToken = pair.token;
+  serverStatus = {
+    connected: true, root: health.root || '/srv/agileflow', version: health.version || null,
+    workspaceModified: health.workspaceModified || null, error: null
+  };
+}
+
+async function serverReadWorkspace() {
+  const res = await serverFetch('/workspace');
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Não foi possível ler os projetos (${res.status})`);
+  const payload = await res.json();
+  const result = { state: payload.state || payload, savedAt: payload.savedAt || null, revision: payload.revision || null };
+  if (!Array.isArray(result.state?.projects)) throw new Error('Dados do servidor inválidos');
+  return result;
+}
+
+async function serverWriteWorkspace(value) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (serverRevision) headers['If-Match'] = serverRevision;
+  const res = await serverFetch('/workspace', { method: 'PUT', headers, body: JSON.stringify({ state: value }) });
+  if (!res.ok) {
+    const error = new Error(res.status === 409 ? 'Os projetos foram alterados em outro aparelho.' : `Não foi possível salvar (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
+  return res.json();
+}
+
+async function serverCreateBackup() {
+  const res = await serverFetch('/backup', { method: 'POST' });
+  if (!res.ok) throw new Error(`Não foi possível criar o backup (${res.status})`);
+  return res.json();
+}
+
+function queueServerWrite(value) {
+  pendingSnapshot = JSON.parse(JSON.stringify(value));
+  setSyncState('syncing', 'Salvando no servidor Debian…', { pending: true });
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushServerWrites, 250);
+}
+
+async function flushServerWrites() {
+  if (saveInFlight || serverConflictActive || !pendingSnapshot) return;
+  saveInFlight = true;
   try {
-    const wasConnected = bridgeStatus.connected && bridgeStatus.paired;
-    const connected = await detectBridge({ quiet: true });
-    if (!connected) {
-      if (syncState.pending || syncState.code === 'syncing') setSyncState('offline', 'Alterações preservadas no navegador. O AgileFlow tentará sincronizar quando o Bridge voltar.', { pending: true });
-      return;
-    }
-    if (!wasConnected || syncState.pending || syncState.code === 'offline' || syncState.code === 'error') {
-      setSyncState('syncing', 'Bridge reconectado. Salvando alterações locais…', { pending: true });
-      const ok = await bridgeWriteState(state);
-      if (ok) {
-        state.preferences.lastBridgeSyncAt = new Date().toISOString();
-        bridgeStatus.workspaceExists = true;
-        bridgeStatus.workspaceModified = state.meta?.lastSavedAt || state.preferences.lastBridgeSyncAt;
-        persistenceAdapter.writeSync(JSON.stringify(state));
-        setSyncState('saved', 'Workspace salvo em Documents/AgileFlow.', { pending: false, at: state.preferences.lastBridgeSyncAt });
-      } else {
-        setSyncState('error', 'Não foi possível gravar no Bridge. As alterações continuam preservadas no navegador.', { pending: true });
+    if (!serverStatus.connected) await connectServer();
+    while (pendingSnapshot && !serverConflictActive) {
+      const snapshot = pendingSnapshot;
+      pendingSnapshot = null;
+      try {
+        const result = await serverWriteWorkspace(snapshot);
+        serverRevision = result.revision || serverRevision;
+        serverStatus.connected = true;
+        serverStatus.workspaceModified = result.savedAt || new Date().toISOString();
+        if (!pendingSnapshot) setSyncState('saved', 'Workspace salvo no Debian.', { pending: false, at: serverStatus.workspaceModified });
+      } catch (error) {
+        if (!pendingSnapshot) pendingSnapshot = snapshot;
+        if (error.status === 409) {
+          serverConflictActive = true;
+          modal = { type: 'server-conflict' };
+          setSyncState('error', 'Outra pessoa ou aparelho alterou os projetos. Escolha como continuar.', { pending: true });
+          render();
+        } else {
+          serverStatus.connected = false;
+          serverStatus.error = error.message;
+          setSyncState('offline', 'Alterações ainda não salvas. Mantenha esta aba aberta para tentar novamente.', { pending: true });
+        }
+        break;
       }
     }
   } catch (error) {
-    setSyncState('offline', 'Bridge temporariamente indisponível. Alterações preservadas no navegador.', { pending: true });
+    serverStatus.connected = false;
+    serverStatus.error = error.message;
+    setSyncState('offline', 'Servidor indisponível. Mantenha esta aba aberta até salvar.', { pending: true });
+  } finally {
+    saveInFlight = false;
   }
 }
 
-function startBridgeHeartbeat() {
-  if (bridgeHeartbeatTimer) clearInterval(bridgeHeartbeatTimer);
-  bridgeHeartbeatTimer = setInterval(bridgeHeartbeat, 12000);
-}
-
-function bridgeRequestInit(init = {}) {
-  const next = { mode: 'cors', cache: 'no-store', ...init };
+async function serverHeartbeat() {
+  if (!startupReady || saveInFlight || serverConflictActive) return;
+  if (pendingSnapshot) return flushServerWrites();
+  if (modal) return;
   try {
-    if (typeof Request !== 'undefined' && 'targetAddressSpace' in Request.prototype) next.targetAddressSpace = 'loopback';
-  } catch {}
-  return next;
-}
-
-async function bridgeFetch(path, init = {}) {
-  const headers = new Headers(init.headers || {});
-  const token = localStorage.getItem(BRIDGE_TOKEN_KEY);
-  if (token) headers.set('Authorization', `Bearer ${token}`);
-  return fetch(`${BRIDGE_BASE_URL}${path}`, bridgeRequestInit({ ...init, headers }));
-}
-
-async function detectBridge({ quiet = false } = {}) {
-  bridgeStatus = { ...bridgeStatus, state: 'checking', error: null };
-  if (!quiet) render();
-  try {
-    const healthRes = await bridgeFetch('/health');
-    if (!healthRes.ok) throw new Error(`Health ${healthRes.status}`);
-    const health = await healthRes.json();
-    bridgeStatus = {
-      state: 'connected', connected: true, paired: false,
-      platform: health.platform || null, root: health.root || null, workspaceExists: Boolean(health.workspaceExists),
-      workspaceModified: health.workspaceModified || null, version: health.version || null, error: null
-    };
-    // Refaz o pairing a cada detecção para recuperar automaticamente de token antigo/reinstalação.
-    const pairRes = await bridgeFetch('/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-    if (pairRes.ok) {
-      const pair = await pairRes.json();
-      if (pair.token) { localStorage.setItem(BRIDGE_TOKEN_KEY, pair.token); bridgeStatus.paired = true; }
+    const remote = await serverReadWorkspace();
+    if (remote && remote.revision && serverRevision && remote.revision !== serverRevision) {
+      state = normalizeState(remote.state);
+      serverRevision = remote.revision;
+      serverStatus.workspaceModified = remote.savedAt;
+      setSyncState('saved', 'Atualizado com as alterações de outro aparelho.', { pending: false, at: remote.savedAt });
+      render();
+    } else if (!serverStatus.connected) {
+      serverStatus.connected = true;
+      setSyncState('saved', 'Conectado ao servidor.', { pending: false, at: serverStatus.workspaceModified });
+      render();
     }
   } catch (error) {
-    bridgeStatus = { state: 'offline', connected: false, paired: false, platform: null, root: null, workspaceExists: false, workspaceModified: null, version: null, error: String(error?.message || error) };
-  }
-  if (!quiet) render();
-  return bridgeStatus.connected && bridgeStatus.paired;
-}
-
-async function bridgeWriteState(value) {
-  if (!bridgeStatus.connected || !bridgeStatus.paired) return false;
-  try {
-    const res = await bridgeFetch('/workspace', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: value }) });
-    if (!res.ok) throw new Error(`Write ${res.status}`);
-    bridgeStatus.workspaceExists = true;
-    return true;
-  } catch (error) {
-    bridgeStatus.error = String(error?.message || error);
-    return false;
+    serverStatus.connected = false;
+    serverStatus.error = error.message;
+    setSyncState('offline', 'Servidor temporariamente indisponível.', { pending: false });
   }
 }
 
-async function bridgeReadWorkspace() {
-  if (!bridgeStatus.connected || !bridgeStatus.paired) throw new Error('Bridge desconectado');
-  const res = await bridgeFetch('/workspace');
-  if (!res.ok) throw new Error(res.status === 404 ? 'Nenhum workspace local encontrado.' : `Read ${res.status}`);
-  const payload = await res.json();
-  return { state: payload.state || payload, savedAt: payload.savedAt || null, bridgeVersion: payload.bridgeVersion || bridgeStatus.version || null };
-}
-
-async function bridgeReadState() {
-  return (await bridgeReadWorkspace()).state;
-}
-
-async function bridgeCreateBackup() {
-  if (!bridgeStatus.connected || !bridgeStatus.paired) throw new Error('Bridge desconectado');
-  const res = await bridgeFetch('/backup', { method: 'POST' });
-  if (!res.ok) throw new Error(`Backup ${res.status}`);
-  return res.json();
+function startServerHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(serverHeartbeat, 12000);
 }
 
 
@@ -256,8 +260,7 @@ function templateModuleNames(templateKey) {
 }
 
 // Initialize persisted state only after PROJECT_TEMPLATES and template helpers exist.
-state = normalizeState(loadState());
-if (!state.preferences.onboardingCompleted) modal = 'onboarding';
+state = normalizeState(defaultState());
 
 function defaultState() {
   const now = new Date().toISOString();
@@ -269,7 +272,7 @@ function defaultState() {
     projects: [createAgileFlowProject(now)],
     activities: [
       { id: uid(), projectId: 'agileflow', title: 'Projeto criado', detail: 'AgileFlow v0.1 iniciado.', at: now },
-      { id: uid(), projectId: 'agileflow', title: 'Decisão de arquitetura', detail: 'WebApp no Netlify com persistência local planejada via Bridge.', at: now },
+      { id: uid(), projectId: 'agileflow', title: 'Decisão de arquitetura', detail: 'Workspace centralizado no servidor Debian.', at: now },
       { id: uid(), projectId: 'agileflow', title: 'Backlog estruturado', detail: 'Epics e User Stories iniciais adicionados ao próprio projeto AgileFlow.', at: now }
     ]
   };
@@ -335,16 +338,6 @@ function seedStories(now) {
   }));
 }
 
-function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : defaultState();
-  } catch {
-    return defaultState();
-  }
-}
-
-
 function normalizeState(input) {
   const base = input && typeof input === 'object' ? input : defaultState();
   base.schemaVersion = SCHEMA_VERSION;
@@ -352,9 +345,9 @@ function normalizeState(input) {
   base.preferences = base.preferences || {};
   base.preferences.theme = base.preferences.theme === 'dark' ? 'dark' : 'light';
   base.preferences.lastBackupAt = base.preferences.lastBackupAt || null;
-  base.preferences.bridgeMirrorEnabled = Boolean(base.preferences.bridgeMirrorEnabled);
-  base.preferences.bridgePrimaryEnabled = Boolean(base.preferences.bridgePrimaryEnabled || base.preferences.bridgeMirrorEnabled);
-  base.preferences.lastBridgeSyncAt = base.preferences.lastBridgeSyncAt || null;
+  delete base.preferences.bridgeMirrorEnabled;
+  delete base.preferences.bridgePrimaryEnabled;
+  delete base.preferences.lastBridgeSyncAt;
   base.preferences.onboardingCompleted = Boolean(base.preferences.onboardingCompleted);
   base.preferences.backupReminderDays = [0,3,7,14,30].includes(Number(base.preferences.backupReminderDays)) ? Number(base.preferences.backupReminderDays) : 7;
   base.preferences.lastSeenVersion = base.preferences.lastSeenVersion || null;
@@ -504,7 +497,6 @@ function normalizeState(input) {
   });
 
   if (!base.currentProjectId && base.projects[0]) base.currentProjectId = base.projects[0].id;
-  saveStateObject(base, { touch: false });
   return base;
 }
 
@@ -513,106 +505,34 @@ function saveStateObject(value, { touch = true } = {}) {
     value.meta = value.meta || {};
     value.meta.lastSavedAt = new Date().toISOString();
   }
-  persistenceAdapter.writeSync(JSON.stringify(value));
-  if (value?.preferences?.bridgePrimaryEnabled) {
-    if (bridgeStatus.connected && bridgeStatus.paired) {
-      setSyncState('syncing', 'Salvando alterações em Documents/AgileFlow…', { pending: true });
-      scheduleBridgeWrite(value);
-    } else {
-      setSyncState('offline', 'Alterações salvas no navegador e aguardando o Local Bridge.', { pending: true });
-    }
-  } else {
-    setSyncState('browser', 'Workspace salvo neste navegador.', { pending: false, at: value.meta?.lastSavedAt });
-  }
-}
-
-function scheduleBridgeWrite(value) {
-  clearTimeout(bridgeSyncTimer);
-  bridgeSyncTimer = setTimeout(async () => {
-    const ok = await bridgeWriteState(value);
-    if (ok) {
-      value.preferences.lastBridgeSyncAt = new Date().toISOString();
-      persistenceAdapter.writeSync(JSON.stringify(value));
-      bridgeStatus.workspaceExists = true;
-      bridgeStatus.workspaceModified = value.meta?.lastSavedAt || value.preferences.lastBridgeSyncAt;
-      setSyncState('saved', 'Workspace salvo em Documents/AgileFlow.', { pending: false, at: value.preferences.lastBridgeSyncAt });
-      if (activeView === 'data') render();
-    } else {
-      setSyncState('offline', 'Não foi possível alcançar o Bridge. As alterações continuam no navegador e serão sincronizadas quando ele voltar.', { pending: true });
-    }
-  }, 220);
+  queueServerWrite(value);
 }
 
 function saveState() {
   saveStateObject(state);
 }
 
-function stateTimestamp(value) {
-  const raw = value?.meta?.lastSavedAt || value?.preferences?.lastBridgeSyncAt || null;
-  const t = raw ? Date.parse(raw) : 0;
-  return Number.isFinite(t) ? t : 0;
-}
-
-async function initializeLocalFirst() {
+async function initializeServer() {
   try {
-    const connected = await detectBridge({ quiet: true });
-    if (!connected || !state.preferences.bridgePrimaryEnabled) {
-      setSyncState(state.preferences.bridgePrimaryEnabled ? 'offline' : 'browser', state.preferences.bridgePrimaryEnabled ? 'Local Bridge não detectado. Trabalhando com fallback no navegador.' : 'Workspace salvo neste navegador.', { pending: Boolean(state.preferences.bridgePrimaryEnabled), at: state.meta?.lastSavedAt });
-      bridgeStartupResolved = true; render(); startBridgeHeartbeat(); return;
-    }
-
-    if (!bridgeStatus.workspaceExists) {
-      const ok = await bridgeWriteState(state);
-      if (ok) {
-        state.preferences.lastBridgeSyncAt = new Date().toISOString();
-        persistenceAdapter.writeSync(JSON.stringify(state));
-        bridgeStatus.workspaceExists = true;
-      }
-      if (ok) setSyncState('saved', 'Workspace inicial salvo em Documents/AgileFlow.', { pending: false, at: state.preferences.lastBridgeSyncAt });
-      else setSyncState('offline', 'O Bridge foi detectado, mas não foi possível gravar o workspace. As alterações permanecem no navegador.', { pending: true });
-      bridgeStartupResolved = true; render(); startBridgeHeartbeat(); return;
-    }
-
-    const localSnapshot = state;
-    const localTs = stateTimestamp(localSnapshot);
-    const remote = await bridgeReadWorkspace();
-    const remoteCandidate = remote?.state;
-    if (!remoteCandidate || !Array.isArray(remoteCandidate.projects)) throw new Error('Workspace local inválido');
-    const remoteTs = stateTimestamp(remoteCandidate) || (remote.savedAt ? Date.parse(remote.savedAt) : 0);
-
-    if (localTs && remoteTs && Math.abs(localTs - remoteTs) > 1500) {
-      startupConflict = { local: localSnapshot, remote: remoteCandidate, localTs, remoteTs, remoteSavedAt: remote.savedAt || null };
-      syncConflictActive = true;
-      modal = { type: 'sync-conflict' };
-      setSyncState('checking', 'Duas versões diferentes foram encontradas. Escolha qual deve continuar como principal.', { pending: true });
-      return;
-    }
-
-    if (localTs > remoteTs + 1000) {
-      await bridgeWriteState(localSnapshot);
-      state.preferences.lastBridgeSyncAt = new Date().toISOString();
-      persistenceAdapter.writeSync(JSON.stringify(state));
-      setSyncState('saved', 'Alterações offline sincronizadas com Documents/AgileFlow.', { pending: false, at: state.preferences.lastBridgeSyncAt });
-    } else {
-      state = normalizeState(remoteCandidate);
-      state.preferences.bridgePrimaryEnabled = true;
-      state.preferences.bridgeMirrorEnabled = true;
-      state.preferences.lastBridgeSyncAt = remote.savedAt || new Date().toISOString();
-      persistenceAdapter.writeSync(JSON.stringify(state));
-      setSyncState('saved', 'Workspace carregado de Documents/AgileFlow.', { pending: false, at: state.preferences.lastBridgeSyncAt });
-    }
-  } catch (error) {
-    console.error('Local-first startup:', error);
-    bridgeStatus.error = String(error?.message || error);
-    setSyncState('offline', 'Falha ao acessar os arquivos locais. O cache do navegador permanece disponível.', { pending: true });
-  } finally {
-    bridgeStartupResolved = true;
-    if (!syncConflictActive) {
-      if (state.preferences.onboardingCompleted && modal === 'onboarding') modal = null;
-      if (!state.preferences.onboardingCompleted && !modal) modal = 'onboarding';
-    }
+    await connectServer();
+    const remote = await serverReadWorkspace();
+    if (!remote) throw new Error('Não há projetos no servidor. A instalação precisa ser conferida.');
+    if (!remote.revision) throw new Error('O servidor precisa ser atualizado antes de abrir esta versão.');
+    state = normalizeState(remote.state);
+    serverRevision = remote.revision;
+    serverStatus.workspaceModified = remote.savedAt;
+    startupReady = true;
+    modal = state.preferences.onboardingCompleted ? null : 'onboarding';
+    setSyncState('saved', 'Projetos carregados do Debian.', { pending: false, at: remote.savedAt });
     render();
-    startBridgeHeartbeat();
+    startServerHeartbeat();
+  } catch (error) {
+    console.error('Inicialização do servidor:', error);
+    serverStatus.connected = false;
+    serverStatus.error = error.message;
+    const container = document.getElementById('app');
+    container.innerHTML = `<div class="server-startup-error"><h1>Não foi possível abrir os projetos</h1><p>${escapeHtml(error.message)}</p><p>Os dados continuam no servidor Debian. Verifique a conexão e tente novamente.</p><button class="btn btn-primary" id="retryServer">Tentar novamente</button></div>`;
+    document.getElementById('retryServer').addEventListener('click', initializeServer);
   }
 }
 
@@ -709,13 +629,12 @@ function createDemoProject() {
 
 function renderSettings() {
   const reminder = Number(state.preferences?.backupReminderDays ?? 7);
-  const localPath = bridgeStatus.root || 'Documents/AgileFlow';
   const lastBackup = state.preferences?.lastBackupAt ? new Date(state.preferences.lastBackupAt).toLocaleString('pt-BR') : 'Nenhum backup registrado';
   return `
-    <div class="page-head"><div><div class="eyebrow">Stable release • Personal workspace</div><h1>Settings</h1><p>Preferências, diagnóstico e segurança do AgileFlow.</p></div><button class="btn btn-soft" data-action="open-help">? Guia rápido</button></div>
+    <div class="page-head"><div><div class="eyebrow">AgileFlow no Debian</div><h1>Settings</h1><p>Preferências e estado do servidor.</p></div><button class="btn btn-soft" data-action="open-help">? Guia rápido</button></div>
     ${renderBackupReminder()}
     <div class="settings-grid">
-      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Perfil e aparência</h2><p>Personalize somente o que aparece neste workspace.</p></div></div>
+      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Perfil e aparência</h2><p>Personalize o workspace.</p></div></div>
         <form id="settingsForm" class="form-grid">
           <div class="field full"><label>Nome exibido</label><input name="profileName" maxlength="80" value="${escapeHtml(state.profile?.name || 'Rachel')}" /></div>
           <div class="field"><label>Tema</label><select name="theme"><option value="light" ${state.preferences.theme==='light'?'selected':''}>Claro</option><option value="dark" ${state.preferences.theme==='dark'?'selected':''}>Escuro</option></select></div>
@@ -723,12 +642,12 @@ function renderSettings() {
           <div class="form-actions full"><button class="btn btn-primary">Salvar preferências</button></div>
         </form>
       </section>
-      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Local Bridge</h2><p>Diagnóstico da conexão local.</p></div><span class="bridge-status ${bridgeStatus.connected?'online':'offline'}"><i></i>${bridgeStatus.connected?'Conectado':'Não detectado'}</span></div>
-        <div class="settings-kv"><span>WebApp</span><strong>AgileFlow ${escapeHtml(APP_VERSION)} Stable</strong><span>Host atual</span><strong>${escapeHtml(hostingProvider())}</strong><span>Origem</span><strong class="path-value">${escapeHtml(hostingOrigin())}</strong><span>Bridge</span><strong>${escapeHtml(bridgeStatus.version || '—')}</strong><span>Plataforma</span><strong>${escapeHtml(bridgeStatus.platform || '—')}</strong><span>Pasta</span><strong class="path-value">${escapeHtml(localPath)}</strong></div>
-        <div class="data-actions wrap"><button class="btn btn-primary" data-action="bridge-detect">Verificar Bridge</button><button class="btn btn-ghost" data-action="copy-local-path">Copiar caminho da pasta</button></div>
+      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Servidor Debian</h2><p>Local principal dos projetos e arquivos.</p></div><span class="bridge-status ${serverStatus.connected?'online':'offline'}"><i></i>${serverStatus.connected?'Conectado':'Indisponível'}</span></div>
+        <div class="settings-kv"><span>WebApp</span><strong>AgileFlow ${escapeHtml(APP_VERSION)}</strong><span>Endereço</span><strong class="path-value">${escapeHtml(hostingOrigin())}</strong><span>Versão do servidor</span><strong>${escapeHtml(serverStatus.version || '—')}</strong><span>Pasta principal</span><strong class="path-value">${escapeHtml(serverStatus.root)}</strong><span>Status</span><strong>${escapeHtml(syncPresentation().label)}</strong></div>
+        <div class="data-actions wrap"><button class="btn btn-primary" data-action="server-refresh">Verificar servidor</button><button class="btn btn-ghost" data-action="copy-server-path">Copiar caminho da pasta</button></div>
       </section>
-      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Segurança dos dados</h2><p>Antes de grandes mudanças, gere uma cópia independente.</p></div></div>
-        <div class="settings-kv"><span>Último backup</span><strong>${escapeHtml(lastBackup)}</strong><span>Modo</span><strong>${state.preferences.bridgePrimaryEnabled?'Local-first + browser fallback':'Browser storage'}</strong><span>Status atual</span><strong>${escapeHtml(syncPresentation().label)}</strong></div>
+      <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Segurança dos dados</h2><p>Cópias adicionais ajudam a recuperar alterações antigas.</p></div></div>
+        <div class="settings-kv"><span>Último backup</span><strong>${escapeHtml(lastBackup)}</strong><span>Modo</span><strong>Servidor Debian</strong></div>
         <div class="data-actions wrap"><button class="btn btn-pink" data-action="backup-now">Criar backup agora</button><button class="btn btn-ghost" data-view="data">Abrir Data & Backup</button></div>
       </section>
       <section class="card card-pad settings-panel"><div class="section-title"><div><h2>Ajuda e primeiro uso</h2><p>Reabra o guia ou explore um projeto fictício.</p></div></div>
@@ -749,17 +668,13 @@ function renderHelpModal() {
 function renderOnboardingModal() {
   return `<div class="modal-backdrop onboarding-backdrop"><div class="modal onboarding-modal" onclick="event.stopPropagation()"><div class="onboarding-brand"><div class="brand-mark">AF</div><div><div class="wizard-kicker">Welcome to AgileFlow</div><h2>Projetos hoje. Portfólio amanhã.</h2></div></div><p class="onboarding-lead">Use o AgileFlow para organizar qualquer projeto, registrar decisões e transformar experiências reais em evidências profissionais.</p>
     <div class="onboarding-steps"><article><span>1</span><strong>Crie o projeto</strong><p>Escolha Scrum, Kanban, Hybrid, Simple ou Academic.</p></article><article><span>2</span><strong>Gerencie o trabalho</strong><p>Use backlog, board, goals, risks, Sprints e decisões conforme o contexto.</p></article><article><span>3</span><strong>Registre evidências</strong><p>Marque resultados, decisões e aprendizados relevantes.</p></article><article><span>4</span><strong>Construa o portfólio</strong><p>O histórico alimenta Growth, Portfolio e Case Study.</p></article></div>
-    <div class="onboarding-storage"><strong>${bridgeStatus.connected?'✓ Local Bridge conectado':'○ Local Bridge será verificado automaticamente'}</strong><span>Os dados continuam locais; o WebApp não exige banco online.</span></div>
+    <div class="onboarding-storage"><strong>✓ Projetos no servidor Debian</strong><span>As alterações são salvas no servidor e aparecem nos outros aparelhos.</span></div>
     <div class="onboarding-actions"><button class="btn btn-ghost" data-action="onboarding-demo">Explorar projeto-demo</button><button class="btn btn-primary" data-action="onboarding-finish">Entrar no AgileFlow</button></div>
   </div></div>`;
 }
 
-function renderConflictModal() {
-  if (!startupConflict) return '';
-  const browserNewer = startupConflict.localTs > startupConflict.remoteTs;
-  const browserDate = startupConflict.localTs ? new Date(startupConflict.localTs).toLocaleString('pt-BR') : 'sem data';
-  const localDate = startupConflict.remoteTs ? new Date(startupConflict.remoteTs).toLocaleString('pt-BR') : 'sem data';
-  return `<div class="modal-backdrop"><div class="modal conflict-modal"><div class="modal-head"><div><div class="wizard-kicker">Data safety</div><h2>Duas versões diferentes foram encontradas</h2><p>Escolha conscientemente qual cópia deve continuar como principal. Nenhuma será substituída antes da sua decisão.</p></div></div><div class="modal-body"><div class="conflict-grid"><article class="${browserNewer?'recommended':''}"><small>Navegador</small><strong>${browserNewer?'Mais recente':'Cópia disponível'}</strong><span>${escapeHtml(browserDate)}</span><button class="btn btn-primary" data-action="conflict-use-browser">Usar esta cópia</button></article><article class="${!browserNewer?'recommended':''}"><small>Documents/AgileFlow</small><strong>${!browserNewer?'Mais recente':'Cópia disponível'}</strong><span>${escapeHtml(localDate)}</span><button class="btn btn-primary" data-action="conflict-use-local">Usar esta cópia</button></article></div><div class="safety-note"><strong>Quer segurança extra?</strong><span>“Backup e usar a mais recente” cria um backup local pelo Bridge antes de continuar.</span></div><div class="form-actions"><button class="btn btn-pink" data-action="conflict-backup-newer">Backup e usar a mais recente</button></div></div></div></div>`;
+function renderServerConflictModal() {
+  return `<div class="modal-backdrop"><div class="modal conflict-modal"><div class="modal-head"><div><h2>Alterações em outro aparelho</h2><p>Este servidor recebeu uma versão mais recente enquanto você editava. Baixe uma cópia das suas alterações antes de decidir.</p></div></div><div class="modal-body"><div class="safety-note"><strong>Seus dados ainda estão nesta aba.</strong><span>Você pode baixar esta cópia, carregar a versão do servidor ou substituir a versão do servidor pela que está aberta aqui.</span></div><div class="form-actions"><button class="btn btn-ghost" data-action="conflict-export">Baixar minha cópia</button><button class="btn btn-soft" data-action="conflict-reload">Usar versão do servidor</button><button class="btn btn-danger" data-action="conflict-overwrite">Substituir no servidor</button></div></div></div></div>`;
 }
 
 function icon(name) {
@@ -799,7 +714,7 @@ function render() {
           ${navButton('settings','Settings')}
         </nav>
         <div class="sidebar-foot">
-          <strong>1.0 Stable • Ready for daily use</strong>
+          <strong>1.1 • Servidor Debian</strong>
           <small>Onboarding, segurança de dados, diagnóstico e acabamento para o primeiro lançamento.</small>
         </div>
       </aside>
@@ -817,7 +732,7 @@ function render() {
             ${(() => { const v = syncPresentation(); return `<div id="syncIndicator" class="sync-indicator ${v.cls}" title="${escapeHtml(syncState.detail || v.label)}"><span class="sync-icon">${v.icon}</span><span>${v.label}</span></div>`; })()}
             <button class="help-button" data-action="open-help" type="button" aria-label="Abrir guia rápido" title="Guia rápido">?</button>
             <button class="theme-toggle" id="themeToggle" type="button" aria-label="Alternar modo claro e escuro" title="Alternar tema"><span class="theme-toggle-icon">${state.preferences.theme === 'dark' ? '☀' : '☾'}</span><span class="theme-toggle-label">${state.preferences.theme === 'dark' ? 'Claro' : 'Escuro'}</span></button>
-            <div class="connection"><span class="dot"></span> ${state.preferences.bridgePrimaryEnabled && bridgeStatus.connected ? 'Local files • Connected' : state.preferences.bridgePrimaryEnabled ? 'Local files • Offline fallback' : 'Browser storage • Bridge ready'}</div>
+            <div class="connection"><span class="dot"></span> Servidor Debian • ${serverStatus.connected ? 'Conectado' : 'Sem conexão'}</div>
           </div>
         </header>
         <section class="content">${renderView(project)}</section>
@@ -1927,7 +1842,7 @@ function renderCaseStudy(project) {
         <div class="section-title"><div><h2>Evidence selection</h2><p>Escolha os registros que sustentam este case.</p></div><span class="badge portfolio-badge">${selected.length} selected</span></div>
         ${all.length ? `<div class="case-evidence-list">${all.map(e=>`<label class="case-evidence-item"><input type="checkbox" data-case-evidence="${escapeHtml(e.id)}" ${selectedIds.has(e.id)?'checked':''}><span><strong>${escapeHtml(e.title)}</strong><small>${escapeHtml(evidenceSourceLabel(e.source))} • ${fmtDate(e.date)}</small></span></label>`).join('')}</div>` : `<div class="empty compact"><span>Adicione evidências no Evidence Hub para fortalecer este case.</span></div>`}
         <div class="case-export-actions"><button class="btn btn-soft" data-action="case-export-json">Exportar JSON</button><button class="btn btn-soft" data-action="case-export-md">Exportar Markdown</button></div>
-        <div class="case-note"><strong>Local-first</strong><span>As exportações são geradas no navegador. Nenhum dado do projeto é enviado para um backend.</span></div>
+        <div class="case-note"><strong>Servidor Debian</strong><span>Os projetos são carregados do servidor. Arquivos exportados são baixados para este aparelho.</span></div>
       </aside>
       <article class="card case-study-preview" id="caseStudyPrintable">
         <div class="case-cover">
@@ -2000,69 +1915,20 @@ function projectExportPayload(project) {
 
 function renderDataBackup(project) {
   const lastBackup = state.preferences?.lastBackupAt ? fmtDate(state.preferences.lastBackupAt) : 'Nenhum backup registrado';
-  const projectCount = state.projects.length;
-  const activities = state.activities.length;
   const approxKb = Math.max(1, Math.round(new Blob([JSON.stringify(state)]).size / 1024));
   return `
-    <div class="page-head">
-      <div><div class="eyebrow">Local-first • Data safety</div><h1>Data & Backup</h1><p>Proteja o workspace, mova projetos entre Windows e macOS e conecte o WebApp ao Local Bridge sem banco online.</p></div>
-      <button class="btn btn-pink" data-action="export-workspace">⇩ Backup completo</button>
-    </div>
+    <div class="page-head"><div><div class="eyebrow">Servidor Debian • Cópias de segurança</div><h1>Data & Backup</h1><p>Todos os projetos ficam no Debian e podem ser acessados em qualquer aparelho pelo endereço online.</p></div><button class="btn btn-pink" data-action="export-workspace">⇩ Baixar cópia</button></div>
     <div class="grid stats">
-      ${statCard('Projetos', projectCount, 'Incluídos no backup', 'blue')}
-      ${statCard('Atividades', activities, 'Histórico preservado', '')}
-      ${statCard('Tamanho local', `~${approxKb} KB`, 'Estimativa do JSON atual', 'pink')}
-      ${statCard('Último backup', lastBackup, 'Registrado neste navegador', '')}
+      ${statCard('Projetos', state.projects.length, 'No servidor', 'blue')}
+      ${statCard('Atividades', state.activities.length, 'Histórico preservado', '')}
+      ${statCard('Tamanho', `~${approxKb} KB`, 'Workspace atual', 'pink')}
+      ${statCard('Último backup', lastBackup, 'Registrado no servidor', '')}
     </div>
-
     <div class="data-grid">
-      <section class="card card-pad data-panel">
-        <div class="section-title"><div><h2>Workspace completo</h2><p>Todos os projetos, preferências e histórico.</p></div><span class="badge blue">.json</span></div>
-        <p class="data-copy">Use este arquivo para recuperar o AgileFlow neste ou em outro computador. A restauração substitui o workspace atual somente após sua confirmação.</p>
-        <div class="data-actions"><button class="btn btn-primary" data-action="export-workspace">Exportar backup</button><button class="btn btn-ghost" data-action="choose-workspace-import">Importar backup</button></div>
-        <input class="file-input" id="workspaceImportFile" type="file" accept="application/json,.json,.agileflow" />
-      </section>
-
-      <section class="card card-pad data-panel">
-        <div class="section-title"><div><h2>Projeto atual</h2><p>${project ? escapeHtml(project.name) : 'Nenhum projeto selecionado'}</p></div><span class="badge pink">Portable</span></div>
-        <p class="data-copy">Exporte somente um projeto para levar entre Windows e macOS, arquivar ou compartilhar uma cópia sem expor os demais dados do workspace.</p>
-        <div class="data-actions"><button class="btn btn-primary" data-action="export-project" ${project?'':'disabled'}>Exportar projeto</button><button class="btn btn-ghost" data-action="choose-project-import">Importar projeto</button></div>
-        <input class="file-input" id="projectImportFile" type="file" accept="application/json,.json,.agileproject" />
-      </section>
-
-      <section class="card card-pad data-panel project-files-panel">
-        <div class="section-title"><div><h2>Arquivos do projeto</h2><p>${project ? escapeHtml(project.name) : 'Nenhum projeto selecionado'}</p></div><span class="badge blue">Local files</span></div>
-        ${project ? `
-          <p class="data-copy">Quando o modo Local-first está ativo, o Bridge materializa este projeto em arquivos legíveis dentro de <code>Documents/AgileFlow/projects/${escapeHtml(slugify(project.name))}/</code>.</p>
-          <div class="file-tree"><code>project.json</code><code>backlog/epics.json</code><code>backlog/stories.json</code><code>sprints/</code><code>retrospectives/</code><code>decisions/</code><code>impediments/</code><code>evidence/</code><code>case-study.json</code></div>
-          <div class="safety-note"><strong>Portável e legível.</strong><span>O workspace completo continua em <code>workspace.json</code>, enquanto esses arquivos separados facilitam backup, inspeção e recuperação por projeto.</span></div>
-        ` : '<p class="data-copy">Crie ou selecione um projeto para visualizar sua estrutura local.</p>'}
-      </section>
-
-      <section class="card card-pad data-panel bridge-panel">
-        <div class="section-title"><div><h2>Local Bridge</h2><p>Conexão entre o WebApp e as pastas deste computador.</p></div><span class="bridge-status ${bridgeStatus.connected ? 'online' : bridgeStatus.state === 'checking' ? 'checking' : 'offline'}"><i></i>${bridgeStatus.connected ? 'Conectado' : bridgeStatus.state === 'checking' ? 'Verificando' : 'Não detectado'}</span></div>
-        <div class="bridge-flow"><span>AgileFlow WebApp</span><b>→</b><span>Local Bridge</span><b>→</b><span class="active-store">Documents/AgileFlow</span></div>
-        ${bridgeStatus.connected ? `
-          <div class="bridge-details">
-            <div><small>Versão</small><strong>${escapeHtml(bridgeStatus.version || '—')}</strong></div>
-            <div><small>Plataforma</small><strong>${escapeHtml(bridgeStatus.platform || '—')}</strong></div>
-            <div class="wide"><small>Pasta local</small><strong>${escapeHtml(bridgeStatus.root || '—')}</strong></div>
-            <div><small>Workspace local</small><strong>${bridgeStatus.workspaceExists ? 'Encontrado' : 'Ainda vazio'}</strong></div>
-            <div><small>Modo de dados</small><strong>${state.preferences.bridgePrimaryEnabled ? 'Local-first' : 'Browser only'}</strong></div>
-            <div><small>Última sincronização</small><strong>${state.preferences.lastBridgeSyncAt ? fmtDate(state.preferences.lastBridgeSyncAt) : '—'}</strong></div>
-          </div>
-          <div class="data-actions wrap">
-            <button class="btn btn-primary" data-action="bridge-enable-mirror">${state.preferences.bridgePrimaryEnabled ? 'Sincronizar agora' : 'Ativar Local-first'}</button>
-            ${bridgeStatus.workspaceExists ? '<button class="btn btn-ghost" data-action="bridge-load">Recarregar dos arquivos locais</button>' : ''}
-            <button class="btn btn-ghost" data-action="bridge-backup">Criar backup local</button>
-            ${state.preferences.bridgePrimaryEnabled ? '<button class="btn btn-ghost" data-action="bridge-disable-mirror">Usar somente navegador</button>' : ''}
-          </div>
-        ` : `
-          <p class="data-copy">O AgileFlow continua usando o navegador normalmente. Quando o Bridge estiver instalado e executando, esta página o detectará em <code>127.0.0.1:43127</code> e poderá espelhar os dados para arquivos locais.</p>
-          <div class="data-actions"><button class="btn btn-primary" data-action="bridge-detect">Detectar novamente</button></div>
-        `}
-        <div class="safety-note"><strong>Local-first com fallback.</strong><span>Quando o Bridge está conectado, Documents/AgileFlow é a fonte principal. Se ele estiver fechado, o AgileFlow continua funcionando pelo cache do navegador e sincroniza a cópia mais recente quando o Bridge voltar.</span></div>
-      </section>
+      <section class="card card-pad data-panel"><div class="section-title"><div><h2>Workspace completo</h2><p>Todos os projetos, preferências e histórico.</p></div><span class="badge blue">.json</span></div><p class="data-copy">Baixe uma cópia para guardar fora do servidor. Restaurar um backup substitui os projetos atuais após sua confirmação.</p><div class="data-actions"><button class="btn btn-primary" data-action="export-workspace">Baixar cópia</button><button class="btn btn-ghost" data-action="choose-workspace-import">Restaurar cópia</button></div><input class="file-input" id="workspaceImportFile" type="file" accept="application/json,.json,.agileflow" /></section>
+      <section class="card card-pad data-panel"><div class="section-title"><div><h2>Projeto atual</h2><p>${project ? escapeHtml(project.name) : 'Nenhum projeto selecionado'}</p></div><span class="badge pink">.json</span></div><p class="data-copy">Exporte ou importe somente um projeto.</p><div class="data-actions"><button class="btn btn-primary" data-action="export-project" ${project?'':'disabled'}>Exportar projeto</button><button class="btn btn-ghost" data-action="choose-project-import">Importar projeto</button></div><input class="file-input" id="projectImportFile" type="file" accept="application/json,.json,.agileproject" /></section>
+      <section class="card card-pad data-panel project-files-panel"><div class="section-title"><div><h2>Arquivos no Debian</h2><p>${project ? escapeHtml(project.name) : 'Nenhum projeto selecionado'}</p></div><span class="badge blue">Servidor</span></div><p class="data-copy">O workspace principal fica em <code>${escapeHtml(serverStatus.root)}/workspace.json</code>. Cada projeto também tem arquivos separados em <code>${escapeHtml(serverStatus.root)}/projects/</code>.</p><div class="file-tree"><code>project.json</code><code>backlog/epics.json</code><code>backlog/stories.json</code><code>sprints/</code><code>retrospectives/</code><code>decisions/</code><code>evidence/</code><code>case-study.json</code></div></section>
+      <section class="card card-pad data-panel bridge-panel"><div class="section-title"><div><h2>Conexão com o servidor</h2><p>Estado da única fonte dos dados.</p></div><span class="bridge-status ${serverStatus.connected?'online':'offline'}"><i></i>${serverStatus.connected?'Conectado':'Indisponível'}</span></div><div class="bridge-flow"><span>AgileFlow</span><b>→</b><span class="active-store">Servidor Debian</span><b>→</b><span>Arquivos dos projetos</span></div><div class="bridge-details"><div><small>Endereço</small><strong>${escapeHtml(hostingOrigin())}</strong></div><div><small>Pasta</small><strong>${escapeHtml(serverStatus.root)}</strong></div><div><small>Última gravação</small><strong>${serverStatus.workspaceModified ? escapeHtml(new Date(serverStatus.workspaceModified).toLocaleString('pt-BR')) : '—'}</strong></div></div><div class="data-actions wrap"><button class="btn btn-primary" data-action="server-refresh">Verificar conexão</button><button class="btn btn-ghost" data-action="backup-now">Criar backup no servidor</button></div></section>
     </div>`;
 }
 
@@ -2092,7 +1958,7 @@ async function importWorkspaceBackup(file) {
     const payload=await readJsonFile(file);
     const candidate=payload?.format==='agileflow-workspace-backup' ? payload.state : payload;
     if(!candidate || !Array.isArray(candidate.projects)) throw new Error('Formato inválido');
-    if(!confirm(`Restaurar este backup com ${candidate.projects.length} projeto(s)? O workspace atual deste navegador será substituído.`)) return;
+    if(!confirm(`Restaurar este backup com ${candidate.projects.length} projeto(s)? Os projetos atuais do servidor serão substituídos.`)) return;
     state=normalizeState(candidate);
     saveState(); activeView='dashboard'; render(); showToast('Backup restaurado com sucesso.');
   } catch (error) {
@@ -2136,7 +2002,7 @@ function renderNoProject() {
 function renderModal() {
   if (modal === 'onboarding') return renderOnboardingModal();
   if (modal === 'help') return renderHelpModal();
-  if (modal && modal.type === 'sync-conflict') return renderConflictModal();
+  if (modal && modal.type === 'server-conflict') return renderServerConflictModal();
   if (modal === 'new-project') {
     const templates = Object.values(PROJECT_TEMPLATES);
     return `<div class="modal-backdrop" data-action="close-modal"><div class="modal modal-project-wizard" onclick="event.stopPropagation()">
@@ -2400,16 +2266,22 @@ function bindEvents() {
   }));
   document.querySelectorAll('[data-action="restart-onboarding"]').forEach(btn=>btn.addEventListener('click',()=>{ state.preferences.onboardingCompleted=false; saveState(); modal='onboarding'; render(); }));
   document.querySelectorAll('[data-action="add-demo-project"]').forEach(btn=>btn.addEventListener('click',()=>{ createDemoProject(); activeView='dashboard'; render(); showToast('Projeto-demo disponível.'); }));
-  document.querySelectorAll('[data-action="copy-local-path"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    const value=bridgeStatus.root || 'Documents/AgileFlow';
-    try { await navigator.clipboard.writeText(value); showToast('Caminho da pasta copiado.'); }
-    catch { showToast(value); }
+  document.querySelectorAll('[data-action="copy-server-path"]').forEach(btn=>btn.addEventListener('click',async()=>{
+    try { await navigator.clipboard.writeText(serverStatus.root); showToast('Caminho copiado.'); }
+    catch { showToast(serverStatus.root); }
+  }));
+  document.querySelectorAll('[data-action="server-refresh"]').forEach(btn=>btn.addEventListener('click',async()=>{
+    await serverHeartbeat(); render(); showToast(serverStatus.connected ? 'Servidor conectado.' : 'Servidor indisponível.');
   }));
   document.querySelectorAll('[data-action="backup-now"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    if(bridgeStatus.connected && bridgeStatus.paired){
-      try { const result=await bridgeCreateBackup(); state.preferences.lastBackupAt=new Date().toISOString(); addActivity('Backup local criado', result?.file || 'Backup salvo pelo Local Bridge.', state.currentProjectId); saveState(); render(); showToast('Backup local criado.'); }
-      catch(error){ console.error(error); exportWorkspaceBackup(); }
-    } else exportWorkspaceBackup();
+    try {
+      if (pendingSnapshot) await flushServerWrites();
+      if (pendingSnapshot) throw new Error('Há alterações ainda não salvas.');
+      await serverCreateBackup();
+      state.preferences.lastBackupAt=new Date().toISOString();
+      addActivity('Backup no servidor criado', 'Cópia completa salva no Debian.', state.currentProjectId);
+      saveState(); render(); showToast('Backup criado no servidor.');
+    } catch(error) { console.error(error); showToast(error.message || 'Não foi possível criar o backup.'); }
   }));
   document.getElementById('settingsForm')?.addEventListener('submit',e=>{
     e.preventDefault(); const fd=new FormData(e.currentTarget);
@@ -2418,26 +2290,30 @@ function bindEvents() {
     state.preferences.backupReminderDays=Number(fd.get('backupReminderDays')||0);
     saveState(); render(); showToast('Preferências salvas.');
   });
-  document.querySelectorAll('[data-action="conflict-use-browser"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    if(!startupConflict) return;
-    state=normalizeState(startupConflict.local); state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true;
-    const ok=await bridgeWriteState(state); state.preferences.lastBridgeSyncAt=new Date().toISOString(); persistenceAdapter.writeSync(JSON.stringify(state));
-    syncConflictActive=false; startupConflict=null; modal=state.preferences.onboardingCompleted?null:'onboarding';
-    setSyncState(ok?'saved':'offline', ok?'Cópia do navegador gravada em Documents/AgileFlow.':'Cópia do navegador preservada; Bridge indisponível.', {pending:!ok,at:state.preferences.lastBridgeSyncAt}); render(); showToast('Cópia do navegador selecionada.');
+  document.querySelectorAll('[data-action="conflict-export"]').forEach(btn=>btn.addEventListener('click',()=>{
+    const copy = pendingSnapshot || state;
+    downloadTextFile(`agileflow-alteracoes-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify({format:'agileflow-workspace-backup',state:copy},null,2), 'application/json;charset=utf-8');
+    showToast('Cópia baixada.');
   }));
-  document.querySelectorAll('[data-action="conflict-use-local"]').forEach(btn=>btn.addEventListener('click',()=>{
-    if(!startupConflict) return;
-    state=normalizeState(startupConflict.remote); state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true; state.preferences.lastBridgeSyncAt=startupConflict.remoteSavedAt||new Date().toISOString(); persistenceAdapter.writeSync(JSON.stringify(state));
-    syncConflictActive=false; startupConflict=null; modal=state.preferences.onboardingCompleted?null:'onboarding'; setSyncState('saved','Cópia de Documents/AgileFlow carregada.',{pending:false,at:state.preferences.lastBridgeSyncAt}); render(); showToast('Cópia local selecionada.');
+  document.querySelectorAll('[data-action="conflict-reload"]').forEach(btn=>btn.addEventListener('click',async()=>{
+    if (!confirm('Descartar as alterações desta aba e carregar os projetos atuais do servidor?')) return;
+    try {
+      const remote = await serverReadWorkspace();
+      if (!remote) throw new Error('Workspace não encontrado.');
+      state=normalizeState(remote.state); serverRevision=remote.revision;
+      pendingSnapshot=null; serverConflictActive=false; modal=null;
+      setSyncState('saved','Versão atual do servidor carregada.',{pending:false,at:remote.savedAt}); render();
+    } catch(error) { showToast(error.message); }
   }));
-  document.querySelectorAll('[data-action="conflict-backup-newer"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    if(!startupConflict) return;
-    try { await bridgeCreateBackup(); } catch(error) { console.warn('Backup local antes do conflito:', error); }
-    downloadTextFile(`agileflow-browser-conflict-${new Date().toISOString().slice(0,10)}.json`,JSON.stringify({format:'agileflow-workspace-backup',formatVersion:1,agileFlowVersion:APP_VERSION,exportedAt:new Date().toISOString(),state:startupConflict.local},null,2),'application/json;charset=utf-8');
-    const useBrowser=startupConflict.localTs>=startupConflict.remoteTs;
-    if(useBrowser){ state=normalizeState(startupConflict.local); state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true; await bridgeWriteState(state); state.preferences.lastBridgeSyncAt=new Date().toISOString(); }
-    else { state=normalizeState(startupConflict.remote); state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true; state.preferences.lastBridgeSyncAt=startupConflict.remoteSavedAt||new Date().toISOString(); }
-    state.preferences.lastBackupAt=new Date().toISOString(); persistenceAdapter.writeSync(JSON.stringify(state)); syncConflictActive=false; startupConflict=null; modal=state.preferences.onboardingCompleted?null:'onboarding'; setSyncState('saved','Conflito resolvido após criar backups das cópias.',{pending:false,at:state.preferences.lastBridgeSyncAt}); render(); showToast('Backup criado e versão mais recente mantida.');
+  document.querySelectorAll('[data-action="conflict-overwrite"]').forEach(btn=>btn.addEventListener('click',async()=>{
+    if (!confirm('Substituir os projetos do servidor por esta cópia? A versão atual do servidor será guardada em backup.')) return;
+    try {
+      const remote = await serverReadWorkspace();
+      serverRevision=remote.revision;
+      const result=await serverWriteWorkspace(pendingSnapshot || state);
+      serverRevision=result.revision; pendingSnapshot=null; serverConflictActive=false; modal=null;
+      setSyncState('saved','Esta cópia foi salva no servidor.',{pending:false,at:result.savedAt}); render();
+    } catch(error) { showToast(error.message); }
   }));
   document.querySelectorAll('[data-action="export-workspace"]').forEach(btn=>btn.addEventListener('click',exportWorkspaceBackup));
   document.querySelectorAll('[data-action="export-project"]').forEach(btn=>btn.addEventListener('click',exportCurrentProject));
@@ -2445,36 +2321,6 @@ function bindEvents() {
   document.querySelectorAll('[data-action="choose-project-import"]').forEach(btn=>btn.addEventListener('click',()=>document.getElementById('projectImportFile')?.click()));
   document.getElementById('workspaceImportFile')?.addEventListener('change',e=>{ const file=e.target.files?.[0]; if(file) importWorkspaceBackup(file); });
   document.getElementById('projectImportFile')?.addEventListener('change',e=>{ const file=e.target.files?.[0]; if(file) importProjectFile(file); });
-  document.querySelectorAll('[data-action="bridge-detect"]').forEach(btn=>btn.addEventListener('click',()=>detectBridge()));
-  document.querySelectorAll('[data-action="bridge-enable-mirror"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    if(!bridgeStatus.connected || !bridgeStatus.paired){ await detectBridge(); if(!bridgeStatus.connected){ showToast('Local Bridge não detectado.'); return; } }
-    state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true;
-    state.meta = state.meta || {}; state.meta.lastSavedAt = new Date().toISOString();
-    const ok=await bridgeWriteState(state);
-    if(ok){
-      state.preferences.lastBridgeSyncAt=new Date().toISOString();
-      persistenceAdapter.writeSync(JSON.stringify(state)); setSyncState('saved','Modo Local-first ativado. Workspace salvo em Documents/AgileFlow.',{pending:false,at:state.preferences.lastBridgeSyncAt}); render(); showToast('Modo Local-first ativado e sincronizado.');
-    } else {
-      state.preferences.bridgePrimaryEnabled=false; state.preferences.bridgeMirrorEnabled=false;
-      persistenceAdapter.writeSync(JSON.stringify(state)); setSyncState('browser','Não foi possível ativar Local-first. O workspace continua salvo no navegador.',{pending:false,at:state.meta?.lastSavedAt}); showToast('Não foi possível gravar no Local Bridge.');
-    }
-  }));
-  document.querySelectorAll('[data-action="bridge-disable-mirror"]').forEach(btn=>btn.addEventListener('click',()=>{
-    state.preferences.bridgePrimaryEnabled=false; state.preferences.bridgeMirrorEnabled=false; persistenceAdapter.writeSync(JSON.stringify(state)); setSyncState('browser','Workspace salvo somente neste navegador.',{pending:false,at:state.meta?.lastSavedAt}); render(); showToast('Agora o AgileFlow usa somente o armazenamento do navegador.');
-  }));
-  document.querySelectorAll('[data-action="bridge-load"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    try {
-      const remote=await bridgeReadWorkspace(); const candidate=remote.state;
-      if(!candidate || !Array.isArray(candidate.projects)) throw new Error('Workspace local inválido');
-      if(!confirm(`Recarregar o workspace a partir dos arquivos locais com ${candidate.projects.length} projeto(s)? O cache atual deste navegador será substituído.`)) return;
-      state=normalizeState(candidate); state.preferences.bridgePrimaryEnabled=true; state.preferences.bridgeMirrorEnabled=true; state.preferences.lastBridgeSyncAt=remote.savedAt||new Date().toISOString();
-      persistenceAdapter.writeSync(JSON.stringify(state)); setSyncState('saved','Workspace recarregado de Documents/AgileFlow.',{pending:false,at:state.preferences.lastBridgeSyncAt}); activeView='dashboard'; render(); showToast('Workspace recarregado dos arquivos locais.');
-    } catch(error){ console.error(error); showToast(error.message || 'Não foi possível carregar os dados locais.'); }
-  }));
-  document.querySelectorAll('[data-action="bridge-backup"]').forEach(btn=>btn.addEventListener('click',async()=>{
-    try { const result=await bridgeCreateBackup(); state.preferences.lastBackupAt=new Date().toISOString(); addActivity('Backup local criado',result?.file || 'Backup salvo pelo Local Bridge.',state.currentProjectId); saveState(); render(); showToast(result?.file ? `Backup local criado: ${result.file}` : 'Backup local criado.'); }
-    catch(error){ console.error(error); showToast('Não foi possível criar o backup local.'); }
-  }));
   document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => {
     activeView = btn.dataset.view;
     document.getElementById('sidebar')?.classList.remove('open');
@@ -2888,11 +2734,10 @@ function showToast(message) {
 }
 
 window.addEventListener('beforeunload', event => {
-  if (state?.preferences?.bridgePrimaryEnabled && syncState.pending) {
+  if (syncState.pending) {
     event.preventDefault();
     event.returnValue = '';
   }
 });
 
-render();
-setTimeout(() => initializeLocalFirst(), 250);
+initializeServer();

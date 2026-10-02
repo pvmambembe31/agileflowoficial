@@ -1,21 +1,21 @@
-# AgileFlow 1.0 Stable
+# AgileFlow 1.1 — servidor Debian
 
-Build estável do AgileFlow. O mesmo conteúdo pode ser publicado no **Netlify** ou no **GitHub Pages**.
+O servidor Debian é a fonte principal dos projetos. O navegador abre o WebApp, lê `/api/v1/workspace` e grava alterações no mesmo servidor. Os arquivos ficam em `/srv/agileflow`; o aplicativo não usa o Bridge nem o armazenamento do navegador para guardar a versão principal.
 
-## Persistência
-- Chave do navegador preservada: `agileflow.v01`.
-- Schema de dados: 17.
-- Compatível com Local Bridge protocol 1.
-- Dados reais continuam locais em `Documents/AgileFlow` quando Local-first está ativo.
+## Publicação
 
-## Netlify
-Faça deploy do conteúdo da raiz deste pacote.
+1. Atualize a API e o atualizador do Debian com os arquivos em `server/` e o instalador `server/install_server_only.sh`. Faça isso **antes** de publicar a versão 1.1 no GitHub.
+2. Envie os arquivos e pastas deste pacote, extraídos na raiz de `pvmambembe31/agileflowoficial` na branch `main`. O arquivo ZIP isolado não publica o aplicativo.
+3. O timer do Debian verifica o GitHub a cada 30 minutos. Para aplicar imediatamente, execute `sudo systemctl start agileflow-web-update.service` no Debian.
+4. Abra `https://debian.tail4baef6.ts.net/` ou o atalho `AgileFlow Online` e confira os projetos. GitHub Pages e Netlify redirecionam para o Debian.
 
-## GitHub Pages
-1. Crie um repositório público (necessário no GitHub Free para Pages).
-2. Envie todos os arquivos deste pacote para a raiz do repositório.
-3. Em Settings > Pages, selecione **GitHub Actions** como source.
-4. O workflow `.github/workflows/pages.yml` publica automaticamente.
+O instalador salva cópias do workspace, da API e do atualizador anteriores em `/srv/agileflow/backups`. O atualizador preserva a versão anterior do WebApp em `/opt/agileflow/web.previous`.
 
-## Dual host
-O launcher Stable pode preferir Netlify e usar GitHub Pages como fallback. Configure a URL do GitHub Pages no pacote do Bridge/Launcher Stable.
+## Dados
+
+- Principal: `/srv/agileflow/workspace.json`
+- Arquivos por projeto: `/srv/agileflow/projects/`
+- Backups automáticos: `/srv/agileflow/backups/`
+- O ZIP contém somente código. Não contém projetos, senhas ou chaves.
+
+Dois aparelhos podem ler os mesmos projetos. Se ambos tentarem gravar versões diferentes, o servidor rejeita a segunda gravação e o WebApp oferece baixar a cópia da aba antes de escolher qual manter.
